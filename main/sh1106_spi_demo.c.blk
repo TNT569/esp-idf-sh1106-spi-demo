@@ -1,0 +1,126 @@
+#include <stdio.h>
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+#include "lvgl.h"
+#include "ssd1306.h"
+
+
+static const char *TAG = "LVGL_SH1106";
+static SSD1306_t dev;
+
+// ⚠️ 关键：LVGL 不是线程安全的，必须加锁
+static SemaphoreHandle_t lvgl_mutex;
+
+// 使用全屏缓冲区 (128 * 64 = 8192 bytes)
+// ESP32 PSRAM 或内部 RAM 均可，建议用 heap_caps 分配
+static uint8_t lvgl_full_buf[128 * 64]; 
+// SH1106 垂直页式显存缓冲
+static uint8_t oled_page_buf[128 * 8]; // 1024 bytes
+
+// ================= LVGL Flush 回调 (L8 -> SH1106) =================
+static void sh1106_lvgl_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
+{
+    // 获取实际物理分辨率
+    int32_t hor_res = lv_display_get_physical_horizontal_resolution(disp);
+    
+    // 清空 OLED 页缓冲
+    memset(oled_page_buf, 0, sizeof(oled_page_buf));
+
+    // 遍历当前刷新区域覆盖的所有页
+    for (int y = area->y1; y <= area->y2; y++) {
+        int page = y / 8;
+        int bit_pos = y % 8;
+        
+        for (int x = area->x1; x <= area->x2; x++) {
+            // L8 格式：每个像素 1 字节，无 Palette 头，直接索引
+            // px_map 已经是相对于 area 的紧凑排列
+            int32_t local_x = x - area->x1;
+            int32_t local_y = y - area->y1;
+            int32_t w = area->x2 - area->x1 + 1;
+            
+            uint8_t pixel_val = px_map[local_y * w + local_x];
+            
+            // L8 > 127 视为亮，否则灭
+            if (pixel_val > 127) {
+                // SH1106 页缓冲: 每页 128 字节，LSB 对应页顶
+                oled_page_buf[page * 128 + x] |= (1 << bit_pos);
+            }
+        }
+    }
+
+    // 将转换后的数据通过 nopnop2002 库发送到屏幕
+    // 注意：这里我们总是发送完整的 8 页数据，确保 SH1106 不会因局部刷新而出错
+    for (int p = 0; p < 8; p++) {
+        ssd1306_display_image(&dev, p, 0, &oled_page_buf[p * 128], 128);
+    }
+
+    lv_display_flush_ready(disp);
+}
+
+// ================= LVGL Tick 任务 =================
+static void lvgl_tick_task(void *arg)
+{
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(2));
+        lv_tick_inc(2);
+    }
+}
+
+void app_main(void)
+{
+    // === 1. 硬件初始化 (已验证成功) ===
+    ESP_LOGI(TAG, "Init SH1106 Hardware...");
+    spi_master_init(&dev, CONFIG_MOSI_GPIO, CONFIG_SCLK_GPIO, 
+                    CONFIG_CS_GPIO, CONFIG_DC_GPIO, CONFIG_RESET_GPIO);
+    ssd1306_init(&dev, 128, 64);
+    ssd1306_clear_screen(&dev, false);
+    
+    // 硬件自检
+    ssd1306_display_text(&dev, 0, "HW OK", 5, false); 
+    vTaskDelay(pdMS_TO_TICKS(800)); 
+    ssd1306_clear_screen(&dev, false);
+
+    // === 2. LVGL 初始化 ===
+    ESP_LOGI(TAG, "Init LVGL v9...");
+    lv_init();
+    
+    // 创建互斥锁
+    lvgl_mutex = xSemaphoreCreateMutex();
+    configASSERT(lvgl_mutex);
+
+    lv_display_t *disp = lv_display_create(128, 64);
+    configASSERT(disp);
+    
+    // ⚠️ 核心修改：改用 L8 格式，彻底避开 I1 Palette 问题
+    lv_display_set_color_format(disp, LV_COLOR_FORMAT_L8);
+    
+    // ⚠️ 核心修改：使用 FULL 渲染模式 + 全屏 Buffer
+    lv_display_set_buffers(disp, lvgl_full_buf, NULL, sizeof(lvgl_full_buf), 
+                           LV_DISPLAY_RENDER_MODE_FULL);
+    lv_display_set_flush_cb(disp, sh1106_lvgl_flush);
+
+    // === 3. 创建 UI ===
+    xSemaphoreTake(lvgl_mutex, portMAX_DELAY);
+    lv_obj_t *label = lv_label_create(lv_screen_active());
+    lv_label_set_text(label, "Hello SH1106!");
+    lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
+    xSemaphoreGive(lvgl_mutex);
+
+    // === 4. 启动运行时 ===
+    ESP_LOGI(TAG, "Start LVGL Runtime...");
+    xTaskCreate(lvgl_tick_task, "lvgl_tick", 2048, NULL, tskIDLE_PRIORITY + 1, NULL);
+
+    while (1) {
+        xSemaphoreTake(lvgl_mutex, portMAX_DELAY);
+        uint32_t time_till_next = lv_timer_handler();
+        xSemaphoreGive(lvgl_mutex);
+        
+        // 限制最小/最大延迟，防止 CPU 饥饿或 WDT
+        if (time_till_next < 2) time_till_next = 2;
+        if (time_till_next > 500) time_till_next = 500;
+        
+        vTaskDelay(pdMS_TO_TICKS(time_till_next));
+    }
+}
