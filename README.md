@@ -5,7 +5,7 @@ Or if you prefer a slightly shorter version:
 
 "ESP32-S3 + LVGL v9 + SPI SH1106 (nopnop2002 driver) base project hitting 100fps on 128x64 OLED."
 
-The library citation format: <a herf=https://github.com/nopnop2002/esp-idf-ssd1306>nopnop2002/esp-idf-ssd1306</a>
+The library citation format: <a herf=https://github.com/nopnop2002/esp-idf-ssd1306> nopnop2002/esp-idf-ssd1306 </a>
 
 ## Build
 ```shell
